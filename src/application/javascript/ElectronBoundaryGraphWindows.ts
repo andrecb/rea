@@ -1,3 +1,4 @@
+import { javascriptSourceRangeKey } from "../../domain/javascript/javascriptSourceCoordinates.js";
 import type { ApplicationNode } from "../../domain/javascript/javascriptApplicationGraphSchemas.js";
 import type {
   ElectronBrowserWindowFinding,
@@ -21,7 +22,6 @@ import {
   addElectronAstEdge,
   addElectronInferenceEdge,
   electronFindingSourceNode,
-  electronRangeKey,
 } from "./ElectronBoundaryGraphContext.js";
 import {
   artifactPathResolutionProperties,
@@ -86,11 +86,11 @@ const addBrowserWindow = (
     identity: artifactLocalIdentity(
       file.sha256,
       "electron-browser-window",
-      electronRangeKey(value.location),
+      javascriptSourceRangeKey(value.location),
     ),
     observations: [
       {
-        label: `BrowserWindow@${electronRangeKey(value.location)}`,
+        label: `BrowserWindow@${javascriptSourceRangeKey(value.location)}`,
         properties: {
           source_path: file.path,
           options_status: value.options_status,
@@ -98,13 +98,28 @@ const addBrowserWindow = (
           web_preferences: value.web_preferences,
           preload_path: value.preload_path,
           preload_resolution_context: value.preload_resolution_context,
+          ...(value.resolution_sources === undefined
+            ? {}
+            : {
+                resolution_sources: value.resolution_sources.map(
+                  (location) => ({
+                    source: file.path,
+                    ...location,
+                  }),
+                ),
+              }),
           absence_means_default: false,
         },
-        evidence: astObservationEvidence({
+        evidence: (value.resolution_sources === undefined
+          ? astObservationEvidence
+          : staticInferenceEvidence)({
           sha256: file.sha256,
           path: file.path,
           range: value.location,
-          operation: "observe-browser-window-construction",
+          operation:
+            value.resolution_sources === undefined
+              ? "observe-browser-window-construction"
+              : "resolve-browser-window-constant-options",
           coverage,
           limitations: [
             "Only explicitly present webPreferences are reported; omitted properties are not interpreted as Electron defaults.",
@@ -140,6 +155,9 @@ const addWindowPreload = (
     sourcePath: input.file.path,
     context: resolutionContext,
     files: input.context.filesByPath,
+    jsonDocuments: input.context.analysis.jsonDocuments,
+    directoryPaths: input.context.directoryPaths,
+    unanalyzedFiles: input.context.unanalyzedFiles,
     runtimePathKind: "exact-file",
   });
   const role = createElectronRoleNode(input.context, {
@@ -185,7 +203,7 @@ const addContextBridge = (
     identity: artifactLocalIdentity(
       file.sha256,
       "electron-context-bridge",
-      `${value.world}:${value.api_key ?? value.api_key_expression ?? "[missing]"}:${electronRangeKey(value.location)}`,
+      `${value.world}:${value.api_key ?? value.api_key_expression ?? "[missing]"}:${javascriptSourceRangeKey(value.location)}`,
     ),
     observations: [
       {
@@ -232,12 +250,30 @@ const addUtilityProcess = (
   input: FindingInput<ElectronUtilityProcessFinding>,
 ): void => {
   const { context, file, value, coverage } = input;
+  const resolution =
+    value.module_path === null
+      ? undefined
+      : resolveArtifactPathByContext({
+          declaredPath: value.module_path,
+          sourcePath: file.path,
+          context: value.module_resolution_context,
+          files: context.filesByPath,
+          jsonDocuments: context.analysis.jsonDocuments,
+          directoryPaths: context.directoryPaths,
+          unanalyzedFiles: context.unanalyzedFiles,
+          runtimePathKind: "node-entrypoint",
+        });
+  const resolutionProperties = {
+    resolved_path: resolution?.resolved_path ?? null,
+    resolution_status: resolution?.resolution_status ?? null,
+    ...artifactPathResolutionProperties(resolution),
+  };
   const utility = context.accumulator.addNode({
     kind: "electron-utility",
     identity: artifactLocalIdentity(
       file.sha256,
       "electron-utility-process",
-      `${value.module_path ?? value.module_expression}:${electronRangeKey(value.location)}`,
+      `${value.module_path ?? value.module_expression}:${javascriptSourceRangeKey(value.location)}`,
     ),
     observations: [
       {
@@ -256,18 +292,24 @@ const addUtilityProcess = (
           coverage,
         }),
       },
+      ...(resolution === undefined
+        ? []
+        : [
+            {
+              label: "utility process entrypoint resolution",
+              properties: resolutionProperties,
+              evidence: staticInferenceEvidence({
+                sha256: file.sha256,
+                path: file.path,
+                range: value.location,
+                operation: "resolve-utility-process-entrypoint",
+                coverage,
+                limitations: resolution.limitations,
+              }),
+            },
+          ]),
     ],
   });
-  const resolution =
-    value.module_path === null
-      ? undefined
-      : resolveArtifactPathByContext({
-          declaredPath: value.module_path,
-          sourcePath: file.path,
-          context: value.module_resolution_context,
-          files: context.filesByPath,
-          runtimePathKind: "node-entrypoint",
-        });
   addElectronInferenceEdge(context, {
     source: input.source,
     target: utility,
@@ -276,18 +318,11 @@ const addUtilityProcess = (
     coverage,
     relation: "loads",
     operation: "map-utility-process-launch",
+    limitations: resolution?.limitations ?? [],
     properties: {
       declared_path: value.module_path,
       expression: value.module_expression,
-      ...(resolution === undefined
-        ? {}
-        : {
-            resolution_context: resolution.resolution_context,
-            resolved_path: resolution.resolved_path,
-            resolution_status: resolution.resolution_status,
-            limitations: resolution.limitations,
-            ...artifactPathResolutionProperties(resolution),
-          }),
+      ...resolutionProperties,
     },
   });
   if (value.module_path === null) return;
@@ -311,6 +346,7 @@ const addUtilityProcess = (
       resolution_context: resolution.resolution_context,
       resolved_path: resolved,
       resolution_status: resolution.resolution_status,
+      ...artifactPathResolutionProperties(resolution),
     },
   });
 };
